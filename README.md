@@ -17,8 +17,8 @@ For flat sheets, use the 2D playground: https://siatohi80.github.io/attractor-pa
 ## Good to know
 
 - Everything runs in your browser. Files are not uploaded anywhere.
-- The pattern is projected onto the selected faces like a slide projector. Parts steeper than about 70° to the projection direction are left alone.
-- Cutting a closed solid goes right through it along the projection direction.
+- By default the pattern wraps along the selected faces like a decal, so spacing stays even on curved parts. Top, Front, Side and View project it straight along one direction instead.
+- Cutting a closed solid goes through the wall under each opening (with Wrap) or right through along the projection direction (with the other options).
 - Exports are meshes, not NURBS surfaces.
 
 This repo holds only the published page. It is updated from a separate development repo.
