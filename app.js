@@ -123,6 +123,8 @@ function setModel(g,name,info,fid){
   const fa=[...A.faces].reduce((t,id)=>t+A.finfo.get(id).area,0);if(fa>0){S.s=clamp(Math.round(Math.sqrt(fa)/8*2)/2,4,12);if(typeof syncFields==='function')syncFields();}
   // one point attractor in the middle of the facing area to start with
   F=null;computeFrame();const mid=centerHit();if(mid)A.atts.push({t:'point',w:mid});
+  // influence radius in proportion to the patterned area, so the attractor visibly grades the pattern on small and large parts alike
+  if(F.any){S.R=clamp(Math.round(0.5*Math.hypot(F.W-2*PAD,F.H-2*PAD)),10,800);syncFields();}
   showGeometry();frameCamera();changed(true);
 }
 function applyImport(){if(!raw)return;const g=raw.g.clone(),k=raw.unitsFixed?1:A.units;
