@@ -30,7 +30,7 @@ const HIDDEN=new Set(['rd','jewel']);     // live simulation and facet texture d
 // ---------- state ----------
 Object.assign(S,{pattern:'holes',s:12,b:1.5,m:1.5,margin:4,fillet:0.5,R:200,atts:[]});
 const A={geo:null,orig:null,history:[],name:'',info:'',closed:false,sample:'grille',
-  dir:'auto',viewFrame:null,rot:0,ox:0,oy:0,op:'cut',depth:1.5,units:1,up:'z',
+  dir:'wrap',viewFrame:null,rot:0,ox:0,oy:0,op:'cut',depth:1.5,units:1,up:'z',
   atts:[],sel:-1,selP:-1,tool:'select',pending:null,applied:false,busy:false};
 let F=null;          // mapping frame for the original model
 let raw=null;        // last imported geometry before units and axis, so those selects can re-apply
@@ -146,14 +146,15 @@ function pickFace(id,add){
   if(!add){A.faces=new Set([id]);faceMsg='';}
   else{const n=new Set(A.faces);if(n.has(id))n.delete(id);else n.add(id);
     if(!n.size){faceMsg='At least one face stays selected.';}else if(!connected(n)){faceMsg='Faces must touch each other. Pick a face that shares an edge with the selection.';}else{A.faces=n;faceMsg='';}}
-  if(A.dir==='auto')A.viewFrame=null;A.applied=false;changed(true);}
+  A.applied=false;changed(true);}
 
-// ---------- mapping (planar projection) ----------
+// ---------- mapping ----------
+// Two ways to put the flat pattern sheet on the model:
+//  wrap: the selected faces are unrolled with a discrete exponential map (geodesic polar coordinates
+//        grown outward from a seed vertex), so spacing is measured along the surface;
+//  top/front/right/view: a straight planar projection along a fixed direction.
+// Either way F.vs holds sheet coordinates per vertex and F.reg marks the triangles that carry the pattern.
 function baseFrame(){
-  if(A.dir==='auto'){const n=new THREE.Vector3();let ref=null;
-    for(const id of A.faces){const f=A.finfo.get(id);if(!f)continue;const v=f.n.clone();if(!A.closed){if(!ref)ref=v.clone();else if(v.dot(ref)<0)v.negate();}n.add(v);}
-    if(n.lengthSq()>1e-12){const d=n.normalize().negate();let X=new THREE.Vector3(1,0,0);if(Math.abs(d.x)>0.9)X.set(0,1,0);
-      const U=X.addScaledVector(d,-X.dot(d)).normalize(),V=new THREE.Vector3().crossVectors(U,d).normalize();return{d,U,V};}}
   if(A.dir==='view'&&A.viewFrame)return A.viewFrame;
   if(A.dir==='front')return{d:v3([0,1,0]),U:v3([1,0,0]),V:v3([0,0,1])};
   if(A.dir==='right')return{d:v3([-1,0,0]),U:v3([0,1,0]),V:v3([0,0,1])};
@@ -166,23 +167,105 @@ function triNormals(g){const P=g.attributes.position,I=g.index.array,N=new Float
 // a triangle "faces" the projection when its normal points back toward the projector (either side for open surfaces)
 function facingOf(g,d){const N=triNormals(g),n=N.length/3,o=new Uint8Array(n),fid=g.userData.fid,sel=A.faces&&A.faces.size?A.faces:null;
   for(let t=0;t<n;t++){const dot=-(N[3*t]*d.x+N[3*t+1]*d.y+N[3*t+2]*d.z);o[t]=(A.closed?dot:Math.abs(dot))>FACING&&(!sel||sel.has(fid[t]))?1:0;}return o;}
-function computeFrame(){
-  const g=A.geo;if(!g)return;const B=baseFrame(),r=A.rot*Math.PI/180,cr=Math.cos(r),sr=Math.sin(r);
-  const U=B.U.clone().multiplyScalar(cr).addScaledVector(B.V,sr),V=B.V.clone().multiplyScalar(cr).addScaledVector(B.U,-sr),d=B.d.clone();
-  const P=g.attributes.position,I=g.index.array,fac=facingOf(g,d),q=new THREE.Vector3();
-  let a0=1e9,a1=-1e9,b0=1e9,b1=-1e9,any=false;
-  for(let t=0;t<fac.length;t++)if(fac[t])for(let e=0;e<3;e++){q.fromBufferAttribute(P,I[3*t+e]);const a=q.dot(U),b=q.dot(V);a0=Math.min(a0,a);a1=Math.max(a1,a);b0=Math.min(b0,b);b1=Math.max(b1,b);any=true;}
-  if(!any){a0=b0=-1;a1=b1=1;}
-  F={d,U,V,a0,b1,W:a1-a0+2*PAD,H:b1-b0+2*PAD,any};
-  F.toSheet=(p)=>[p.dot(U)-a0+PAD+A.ox,b1-p.dot(V)+PAD+A.oy];
-  F.toPlane=(x,y)=>new THREE.Vector3().addScaledVector(U,x-PAD-A.ox+a0).addScaledVector(V,b1+PAD+A.oy-y);
-  F.mask=buildMask(g,fac);E.setSheet(F.W,F.H);E.setMask(F.mask);
+let wrapCache=null;
+function wrapMap(g){
+  const key=[...A.faces].sort((a,b)=>a-b).join(',');if(wrapCache&&wrapCache.g===g&&wrapCache.key===key)return wrapCache;
+  const P=g.attributes.position,I=g.index.array,nt=I.length/3,nv=P.count,fid=g.userData.fid,N=triNormals(g),reg=new Uint8Array(nt),sg=new Int8Array(nt),em=edgeMap(g);
+  for(let t=0;t<nt;t++)reg[t]=A.faces.has(fid[t])?1:0;
+  // make the region's triangles agree on which side is up (open surfaces can mix them)
+  const dirIn=(u,a,b)=>{for(let e=0;e<3;e++)if(I[3*u+e]===a&&I[3*u+(e+1)%3]===b)return true;return false;};
+  for(let t0=0;t0<nt;t0++){if(!reg[t0]||sg[t0])continue;sg[t0]=1;const st=[t0];
+    while(st.length){const t=st.pop();for(let e=0;e<3;e++){const a=I[3*t+e],b=I[3*t+(e+1)%3],l=em.get(a<b?a*4294967296+b:b*4294967296+a);
+      for(const u of l)if(u!==t&&reg[u]&&!sg[u]){sg[u]=dirIn(u,a,b)?-sg[t]:sg[t];st.push(u);}}}}
+  // area-weighted vertex normals and the region's centroid
+  const VN=new Float32Array(nv*3),q=new THREE.Vector3(),r=new THREE.Vector3(),w=new THREE.Vector3(),cen=new THREE.Vector3();let at=0,flip=0;
+  for(let t=0;t<nt;t++){if(!reg[t])continue;q.fromBufferAttribute(P,I[3*t]);r.fromBufferAttribute(P,I[3*t+1]);w.fromBufferAttribute(P,I[3*t+2]);
+    const ar=r.clone().sub(q).cross(w.clone().sub(q)).length()/2;cen.addScaledVector(q.add(r).add(w),ar/3);at+=ar;
+    for(let e=0;e<3;e++){const i=I[3*t+e];for(let k=0;k<3;k++)VN[3*i+k]+=sg[t]*N[3*t+k]*ar;}flip+=sg[t]*N[3*t+2]*ar;}
+  // keep the side that faces the viewer for closed solids (outward), and the upward side for open surfaces
+  const s0=A.closed?1:(flip<0?-1:1);if(s0<0){for(let i=0;i<VN.length;i++)VN[i]=-VN[i];for(let t=0;t<nt;t++)sg[t]=-sg[t];}
+  if(A.closed)for(let t=0;t<nt;t++)if(reg[t])sg[t]=1;
+  for(let i=0;i<nv;i++){const l=Math.hypot(VN[3*i],VN[3*i+1],VN[3*i+2]);if(l){VN[3*i]/=l;VN[3*i+1]/=l;VN[3*i+2]/=l;}}
+  if(!at)return wrapCache={g,key,reg,sg,VN,u:new Float32Array(nv*2).fill(NaN),seed:-1};
+  cen.multiplyScalar(1/at);
+  // vertex adjacency inside the region
+  const deg=new Int32Array(nv+1);for(let t=0;t<nt;t++)if(reg[t])for(let e=0;e<3;e++){deg[I[3*t+e]+1]+=2;}
+  for(let i=0;i<nv;i++)deg[i+1]+=deg[i];const adj=new Int32Array(deg[nv]),fill=deg.slice(0,nv);
+  for(let t=0;t<nt;t++)if(reg[t])for(let e=0;e<3;e++){const a=I[3*t+e],b=I[3*t+(e+1)%3];adj[fill[a]++]=b;adj[fill[b]++]=a;}
+  let seed=-1,bd=Infinity;for(let i=0;i<nv;i++)if(deg[i+1]>deg[i]){q.fromBufferAttribute(P,i);const d=q.distanceToSquared(cen);if(d<bd){bd=d;seed=i;}}
+  // seed frame: x along world X (or Y when the surface faces along X), y = n × x
+  const n0=new THREE.Vector3(VN[3*seed],VN[3*seed+1],VN[3*seed+2]),e1=new THREE.Vector3(Math.abs(n0.x)>0.9?0:1,Math.abs(n0.x)>0.9?1:0,0);
+  e1.addScaledVector(n0,-e1.dot(n0)).normalize();
+  // Dijkstra over edge lengths; each vertex gets the average of its finished neighbours' predictions
+  const u=new Float32Array(nv*2).fill(NaN),E1=new Float32Array(nv*3),dist=new Float64Array(nv).fill(Infinity),done=new Uint8Array(nv);
+  const heap=[];const push=(d,v)=>{heap.push([d,v]);let i=heap.length-1;while(i){const p=(i-1)>>1;if(heap[p][0]<=heap[i][0])break;[heap[p],heap[i]]=[heap[i],heap[p]];i=p;}};
+  const pop=()=>{const top=heap[0],last=heap.pop();if(heap.length){heap[0]=last;let i=0;for(;;){const l=2*i+1,r2=l+1;let m=i;if(l<heap.length&&heap[l][0]<heap[m][0])m=l;if(r2<heap.length&&heap[r2][0]<heap[m][0])m=r2;if(m===i)break;[heap[m],heap[i]]=[heap[i],heap[m]];i=m;}}return top;};
+  dist[seed]=0;push(0,seed);const pv=new THREE.Vector3(),np=new THREE.Vector3(),ep=new THREE.Vector3(),fp=new THREE.Vector3(),dv=new THREE.Vector3();
+  while(heap.length){const[d,v]=pop();if(done[v]||d>dist[v])continue;done[v]=1;q.fromBufferAttribute(P,v);const nv3=[VN[3*v],VN[3*v+1],VN[3*v+2]];
+    if(v===seed){u[2*v]=0;u[2*v+1]=0;E1[3*v]=e1.x;E1[3*v+1]=e1.y;E1[3*v+2]=e1.z;}
+    else{let sx=0,sy=0,sw=0,par=-1,pd=Infinity;
+      for(let k=deg[v];k<deg[v+1];k++){const p=adj[k];if(!done[p]||p===v)continue;pv.fromBufferAttribute(P,p);dv.subVectors(q,pv);const L=dv.length();if(!L)continue;
+        np.set(VN[3*p],VN[3*p+1],VN[3*p+2]);ep.set(E1[3*p],E1[3*p+1],E1[3*p+2]);fp.crossVectors(np,ep);
+        dv.addScaledVector(np,-dv.dot(np));const lt=dv.length()||1;dv.multiplyScalar(L/lt);const wt=1/L;
+        sx+=wt*(u[2*p]+dv.dot(ep));sy+=wt*(u[2*p+1]+dv.dot(fp));sw+=wt;if(dist[p]+L<pd){pd=dist[p]+L;par=p;}}
+      u[2*v]=sx/sw;u[2*v+1]=sy/sw;
+      ep.set(E1[3*par],E1[3*par+1],E1[3*par+2]);np.set(nv3[0],nv3[1],nv3[2]);ep.addScaledVector(np,-ep.dot(np));if(ep.lengthSq()<1e-12)ep.set(E1[3*par],E1[3*par+1],E1[3*par+2]);ep.normalize();
+      E1[3*v]=ep.x;E1[3*v+1]=ep.y;E1[3*v+2]=ep.z;}
+    for(let k=deg[v];k<deg[v+1];k++){const p=adj[k];if(done[p])continue;pv.fromBufferAttribute(P,p);const nd=dist[v]+pv.distanceTo(q);if(nd<dist[p]){dist[p]=nd;push(nd,p);}}}
+  return wrapCache={g,key,reg,sg,VN,u,seed,n0,e1};
 }
+function computeFrame(){
+  const g=A.geo;if(!g)return;const P=g.attributes.position,I=g.index.array,nt=I.length/3,nv=P.count,r=A.rot*Math.PI/180,cr=Math.cos(r),sr=Math.sin(r);
+  const raw=new Float32Array(nv*2).fill(NaN),q=new THREE.Vector3();let reg,sg,VN=null,d,U,V,W=null;
+  if(A.dir==='wrap'){W=wrapMap(g);reg=W.reg;sg=W.sg;VN=W.VN;
+    for(let i=0;i<nv;i++){const x=W.u[2*i],y=W.u[2*i+1];if(x===x){raw[2*i]=x*cr+y*sr;raw[2*i+1]=y*cr-x*sr;}}
+    const n0=W.seed>=0?W.n0:v3([0,0,1]),e1=W.seed>=0?W.e1:v3([1,0,0]),e2=new THREE.Vector3().crossVectors(n0,e1);
+    d=n0.clone().negate();U=e1.clone().multiplyScalar(cr).addScaledVector(e2,sr);V=e2.clone().multiplyScalar(cr).addScaledVector(e1,-sr);}
+  else{const B=baseFrame();U=B.U.clone().multiplyScalar(cr).addScaledVector(B.V,sr);V=B.V.clone().multiplyScalar(cr).addScaledVector(B.U,-sr);d=B.d.clone();
+    reg=facingOf(g,d);const N=triNormals(g);sg=new Int8Array(nt);
+    for(let t=0;t<nt;t++){const dot=-(N[3*t]*d.x+N[3*t+1]*d.y+N[3*t+2]*d.z);sg[t]=A.closed||dot>=0?1:-1;}
+    for(let i=0;i<nv;i++){q.fromBufferAttribute(P,i);raw[2*i]=q.dot(U);raw[2*i+1]=q.dot(V);}}
+  let a0=1e9,a1=-1e9,b0=1e9,b1=-1e9,any=false;
+  for(let t=0;t<nt;t++)if(reg[t])for(let e=0;e<3;e++){const i=I[3*t+e],a=raw[2*i],b=raw[2*i+1];if(a!==a)continue;a0=Math.min(a0,a);a1=Math.max(a1,a);b0=Math.min(b0,b);b1=Math.max(b1,b);any=true;}
+  if(!any){a0=b0=-1;a1=b1=1;}
+  const vs=new Float32Array(nv*2);for(let i=0;i<nv;i++){vs[2*i]=raw[2*i]-a0+PAD+A.ox;vs[2*i+1]=b1-raw[2*i+1]+PAD+A.oy;}
+  F={d,U,V,a0,b1,W:a1-a0+2*PAD,H:b1-b0+2*PAD,any,reg,sg,vs,VN,wrap:A.dir==='wrap',seed:W?W.seed:-1};
+  F.tri=t=>[0,1,2].map(e=>{const i=I[3*t+e];return[vs[2*i],vs[2*i+1]];});
+  if(F.wrap){F.toSheet=p=>wrapToSheet(g,p);F.toPlane=null;}
+  else{F.toSheet=(p)=>[p.dot(U)-a0+PAD+A.ox,b1-p.dot(V)+PAD+A.oy];F.toPlane=(x,y)=>new THREE.Vector3().addScaledVector(U,x-PAD-A.ox+a0).addScaledVector(V,b1+PAD+A.oy-y);}
+  F.mask=buildMask(g);E.setSheet(F.W,F.H);E.setMask(F.mask);
+}
+// how a triangle's sheet coordinates turn into world directions: dP/dx and dP/dy
+function triJacobian(Pw,T){const e1=Pw[1].clone().sub(Pw[0]),e2=Pw[2].clone().sub(Pw[0]),t1x=T[1][0]-T[0][0],t1y=T[1][1]-T[0][1],t2x=T[2][0]-T[0][0],t2y=T[2][1]-T[0][1],det=t1x*t2y-t2x*t1y||1e-12;
+  return[e1.clone().multiplyScalar(t2y/det).addScaledVector(e2,-t1y/det),e2.clone().multiplyScalar(t1x/det).addScaledVector(e1,-t2x/det)];}
+function triWorld(g,t){const P=g.attributes.position,I=g.index.array;return[0,1,2].map(e=>new THREE.Vector3().fromBufferAttribute(P,I[3*t+e]));}
+// world point -> sheet in wrap mode: nearest point on the wrapped faces, then a tangent-plane step for points just off them
+function wrapToSheet(g,p){
+  const W=wrapCache;if(!W.rg){const I=g.index.array,P=g.attributes.position,list=[],pos=[];for(let t=0;t<W.reg.length;t++)if(W.reg[t]){list.push(t);for(let e=0;e<3;e++){const i=I[3*t+e];pos.push(P.getX(i),P.getY(i),P.getZ(i));}}
+    const rg=new THREE.BufferGeometry();rg.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));if(list.length)rg.computeBoundsTree({indirect:true});W.rg=rg;W.list=list;}
+  if(!W.list.length)return[F.W/2,F.H/2];
+  const h=W.rg.boundsTree.closestPointToPoint(p,{});const t=W.list[h.faceIndex],Pw=triWorld(g,t),T=F.tri(t);
+  const bc=new THREE.Triangle(Pw[0],Pw[1],Pw[2]).getBarycoord(h.point,new THREE.Vector3());let x=bc.x*T[0][0]+bc.y*T[1][0]+bc.z*T[2][0],y=bc.x*T[0][1]+bc.y*T[1][1]+bc.z*T[2][1];
+  const dl=p.clone().sub(h.point);if(dl.lengthSq()>1e-12){const[jx,jy]=triJacobian(Pw,T),a=jx.dot(jx),b=jx.dot(jy),c=jy.dot(jy),det=a*c-b*b;if(Math.abs(det)>1e-12){const r1=jx.dot(dl),r2=jy.dot(dl);x+=(c*r1-b*r2)/det;y+=(a*r2-b*r1)/det;}}
+  return[x,y];}
+// sheet -> surface point, normal and local sheet directions (a grid over the patterned triangles in sheet space)
+function unmap(x,y){
+  const g=A.geo;if(!F.grid){const cell=Math.max(F.W,F.H)/160,nx=Math.ceil(F.W/cell)+1,ny=Math.ceil(F.H/cell)+1,cells=new Map();
+    for(let t=0;t<F.reg.length;t++){if(!F.reg[t])continue;const T=F.tri(t),x0=Math.floor(Math.min(T[0][0],T[1][0],T[2][0])/cell),x1=Math.floor(Math.max(T[0][0],T[1][0],T[2][0])/cell),y0=Math.floor(Math.min(T[0][1],T[1][1],T[2][1])/cell),y1=Math.floor(Math.max(T[0][1],T[1][1],T[2][1])/cell);
+      for(let i=x0;i<=x1;i++)for(let j=y0;j<=y1;j++){const k=i*100003+j;const l=cells.get(k);if(l)l.push(t);else cells.set(k,[t]);}}
+    F.grid={cell,cells};}
+  const l=F.grid.cells.get(Math.floor(x/F.grid.cell)*100003+Math.floor(y/F.grid.cell));if(!l)return null;
+  for(const t of l){const T=F.tri(t),den=(T[1][1]-T[2][1])*(T[0][0]-T[2][0])+(T[2][0]-T[1][0])*(T[0][1]-T[2][1]);if(Math.abs(den)<1e-14)continue;
+    const l0=((T[1][1]-T[2][1])*(x-T[2][0])+(T[2][0]-T[1][0])*(y-T[2][1]))/den,l1=((T[2][1]-T[0][1])*(x-T[2][0])+(T[0][0]-T[2][0])*(y-T[2][1]))/den,l2=1-l0-l1;
+    if(l0<-1e-6||l1<-1e-6||l2<-1e-6)continue;const Pw=triWorld(g,t),p=Pw[0].clone().multiplyScalar(l0).addScaledVector(Pw[1],l1).addScaledVector(Pw[2],l2);
+    const N=Pw[1].clone().sub(Pw[0]).cross(Pw[2].clone().sub(Pw[0])).normalize().multiplyScalar(F.sg[t]||1);
+    return{p,n:N,J:triJacobian(Pw,T),t};}
+  return null;}
 // rasterise the facing triangles onto the sheet, then a distance transform gives "mm to the footprint edge"
-function buildMask(g,fac){
+function buildMask(g){
   const res=Math.max(0.25,Math.max(F.W,F.H)/1400),nx=Math.ceil(F.W/res)+1,ny=Math.ceil(F.H/res)+1,M=new Uint8Array(nx*ny);
-  const P=g.attributes.position,I=g.index.array,q=new THREE.Vector3(),T=[[0,0],[0,0],[0,0]];
-  for(let t=0;t<fac.length;t++){if(!fac[t])continue;for(let e=0;e<3;e++){q.fromBufferAttribute(P,I[3*t+e]);T[e]=F.toSheet(q);}
+  const fac=F.reg;
+  for(let t=0;t<fac.length;t++){if(!fac[t])continue;const T=F.tri(t);
     const x0=Math.max(0,Math.floor(Math.min(T[0][0],T[1][0],T[2][0])/res)),x1=Math.min(nx-1,Math.ceil(Math.max(T[0][0],T[1][0],T[2][0])/res));
     const y0=Math.max(0,Math.floor(Math.min(T[0][1],T[1][1],T[2][1])/res)),y1=Math.min(ny-1,Math.ceil(Math.max(T[0][1],T[1][1],T[2][1])/res));
     const[ax,ay]=T[0],[bx,by]=T[1],[cx,cy]=T[2],den=(by-cy)*(ax-cx)+(cx-bx)*(ay-cy);if(Math.abs(den)<1e-12)continue;
@@ -196,7 +279,7 @@ function buildMask(g,fac){
   for(let k=0;k<D.length;k++)D[k]=D[k]/3*res;
   return{res,nx,ny,d:D};
 }
-function centerHit(){if(!F||!F.any)return null;const ray=new THREE.Raycaster(),o=F.toPlane(F.W/2,F.H/2).addScaledVector(F.d,-1e5);ray.set(o,F.d);
+function centerHit(){if(!F||!F.any)return null;if(F.wrap)return F.seed>=0?new THREE.Vector3().fromBufferAttribute(A.geo.attributes.position,F.seed).toArray():null;const ray=new THREE.Raycaster(),o=F.toPlane(F.W/2,F.H/2).addScaledVector(F.d,-1e5);ray.set(o,F.d);
   const m=new THREE.Mesh(A.geo,new THREE.MeshBasicMaterial({side:THREE.DoubleSide}));const h=ray.intersectObject(m)[0];return h?h.point.toArray():null;}
 
 // ---------- pattern ----------
@@ -223,8 +306,8 @@ function paint(){
   tex.needsUpdate=true;handlesUpdate();
 }
 // each display vertex gets its sheet position as UV; faces that don't face the projector get a corner texel (plain)
-function uvs(){const g=mesh.geometry;if(!g.attributes.position)return;const P=g.attributes.position,n=P.count,uv=new Float32Array(n*2),q=new THREE.Vector3(),fac=facingOf(A.geo,F.d);
-  for(let t=0;t<n/3;t++)for(let e=0;e<3;e++){const i=3*t+e;if(fac[t]){q.fromBufferAttribute(P,i);const[x,y]=F.toSheet(q);uv[2*i]=x/F.W;uv[2*i+1]=1-y/F.H;}else{uv[2*i]=0.001;uv[2*i+1]=0.999;}}
+function uvs(){const g=mesh.geometry;if(!g.attributes.position)return;const P=g.attributes.position,n=P.count,uv=new Float32Array(n*2),fac=F.reg,I=A.geo.index.array;
+  for(let t=0;t<n/3;t++)for(let e=0;e<3;e++){const i=3*t+e,v=I[i];if(fac[t]){uv[2*i]=F.vs[2*v]/F.W;uv[2*i+1]=1-F.vs[2*v+1]/F.H;}else{uv[2*i]=0.001;uv[2*i+1]=0.999;}}
   g.setAttribute('uv',new THREE.BufferAttribute(uv,2));
   const col=new Float32Array(n*3),fid=A.geo.userData.fid,dim=isDark()?0.55:0.7;
   for(let t=0;t<n/3;t++){const on=A.faces.has(fid[t]),v=on?1:dim,tint=on&&!fac[t]?0.93:1;for(let e=0;e<3;e++){const i=3*(3*t+e);col[i]=v*tint;col[i+1]=v*tint;col[i+2]=v;}}
@@ -316,9 +399,9 @@ const tick=()=>new Promise(r=>requestAnimationFrame(()=>r()));
 
 // Split every facing triangle along the pattern outlines (exact, in sheet space), then drop, raise or sink the pieces inside.
 async function clipOp(op,depth,progress){
-  const g=A.geo,P=g.attributes.position,I=g.index.array,nt=I.length/3,fac=facingOf(g,F.d),N=triNormals(g),polys=shapePolys(),query=shapeGrid(polys);
+  const g=A.geo,P=g.attributes.position,I=g.index.array,nt=I.length/3,fac=F.reg,N=triNormals(g),polys=shapePolys(),query=shapeGrid(polys);
   // displacement direction per vertex: averaged from facing triangles only, so sharp edges don't skew it
-  const VN=new Float32Array(P.count*3);for(let t=0;t<nt;t++)if(fac[t]){let s=1;if(!A.closed){const dot=-(N[3*t]*F.d.x+N[3*t+1]*F.d.y+N[3*t+2]*F.d.z);s=dot<0?-1:1;}
+  const VN=new Float32Array(P.count*3);for(let t=0;t<nt;t++)if(fac[t]){const s=F.sg[t]||1;
     for(let e=0;e<3;e++){const i=I[3*t+e];VN[3*i]+=s*N[3*t];VN[3*i+1]+=s*N[3*t+1];VN[3*i+2]+=s*N[3*t+2];}}
   for(let i=0;i<P.count;i++){const l=Math.hypot(VN[3*i],VN[3*i+1],VN[3*i+2])||1;VN[3*i]/=l;VN[3*i+1]/=l;VN[3*i+2]/=l;}
   const out=[],ofid=[],FID=g.userData.fid;let cur=-1;const push=(a,b,c)=>{out.push(a.x,a.y,a.z,b.x,b.y,b.z,c.x,c.y,c.z);ofid.push(cur);},sgn=op==='emboss'?1:op==='recess'?-1:0;
@@ -328,7 +411,7 @@ async function clipOp(op,depth,progress){
     if(t%1500===0){progress(t/nt);await tick();}
     for(let e=0;e<3;e++){const i=I[3*t+e];Pw[e].fromBufferAttribute(P,i);Nw[e].set(VN[3*i],VN[3*i+1],VN[3*i+2]);}cur=FID[t];
     if(!fac[t]){push(Pw[0],Pw[1],Pw[2]);continue;}
-    const T=Pw.map(p=>F.toSheet(p)),s0=sarea(T);
+    const T=F.tri(t),s0=sarea(T),[Jx,Jy]=triJacobian(Pw,T);
     const cand=Math.abs(s0)<1e-10?[]:query(Math.min(T[0][0],T[1][0],T[2][0]),Math.min(T[0][1],T[1][1],T[2][1]),Math.max(T[0][0],T[1][0],T[2][0]),Math.max(T[0][1],T[1][1],T[2][1]));
     if(!cand.length){push(Pw[0],Pw[1],Pw[2]);continue;}
     const tri=[[s0>0?T:[T[0],T[2],T[1]]]];let outside,inside=[];
@@ -350,7 +433,7 @@ async function clipOp(op,depth,progress){
       poly.forEach((ring,k)=>{let r=openRing(ring);const s=sarea(r);if((k===0&&s<0)||(k>0&&s>0))r=r.reverse();
         for(let i=0;i<r.length;i++){const a=r[i],b=r[(i+1)%r.length],la=bary(a),lb=bary(b);if([0,1,2].some(e=>Math.abs(la[e])<1e-7&&Math.abs(lb[e])<1e-7))continue;
           const A0=lift(a,0),B0=lift(b,0),A1=lift(a,sgn*depth),B1=lift(b,sgn*depth);
-          const ex=b[1]-a[1],ey=-(b[0]-a[0]),want=F.U.clone().multiplyScalar(ex).addScaledVector(F.V,-ey).multiplyScalar(sgn);
+          const ex=b[1]-a[1],ey=-(b[0]-a[0]),want=Jx.clone().multiplyScalar(ex).addScaledVector(Jy,ey).multiplyScalar(sgn);
           const n=new THREE.Vector3().subVectors(B0,A0).cross(new THREE.Vector3().subVectors(B1,A0));
           if(n.dot(want)>=0){push(A0,B0,B1);push(A0,B1,A1);}else{push(A0,B1,B0);push(A0,A1,B1);}}});}
   }
@@ -363,21 +446,32 @@ async function csgCut(progress){
   const {Brush,Evaluator,SUBTRACTION}=await import('three-bvh-csg');
   const polys=shapePolys(),g=A.geo;g.computeBoundingBox();const bb=g.boundingBox,cs=[];
   for(const x of[bb.min.x,bb.max.x])for(const y of[bb.min.y,bb.max.y])for(const z of[bb.min.z,bb.max.z])cs.push(new THREE.Vector3(x,y,z).dot(F.d));
-  const t0=Math.min(...cs)-5,t1=Math.max(...cs)+5,pos=[];
+  const t0=Math.min(...cs)-5,t1=Math.max(...cs)+5,diag=bb.getSize(new THREE.Vector3()).length(),pos=[];let skipped=0;
+  let probe=null;const ray=new THREE.Raycaster();if(F.wrap){g.computeBoundsTree({indirect:true});probe=new THREE.Mesh(g,new THREE.MeshBasicMaterial({side:THREE.DoubleSide}));}
   for(const p of polys)for(const poly of p.mp){let ring=openRing(poly[0]);if(sarea(ring)<0)ring=ring.reverse();if(ring.length<3)continue;
-    const flat=ring.flat(),tris=EARCUT(flat),base=ring.map(q=>F.toPlane(q[0],q[1])),lo=base.map(b=>b.clone().addScaledVector(F.d,t0)),hi=base.map(b=>b.clone().addScaledVector(F.d,t1));
-    const add=(a,b,c)=>pos.push(a.x,a.y,a.z,b.x,b.y,b.z,c.x,c.y,c.z);
+    let lo,hi;
+    if(F.wrap){// each outline point lands on the surface; the prism runs along the opening's average normal, out 5 mm and in right through
+      const hits=ring.map(q=>unmap(q[0],q[1]));if(hits.some(h=>!h)){skipped++;continue;}
+      const n=hits.reduce((m,h)=>m.add(h.n),new THREE.Vector3()).normalize(),c=hits.reduce((m,h)=>m.add(h.p),new THREE.Vector3()).multiplyScalar(1/hits.length);
+      // only as deep as the wall: the first surface the inward ray meets, plus a little (short prisms keep CSG fast)
+      ray.set(c.clone().addScaledVector(n,1),n.clone().negate());const hh=ray.intersectObject(probe).find(h=>h.distance>1.02);const depth=hh?hh.distance+1:diag;
+      lo=hits.map(h=>h.p.clone().addScaledVector(n,-depth));hi=hits.map(h=>h.p.clone().addScaledVector(n,2));}
+    else{const base=ring.map(q=>F.toPlane(q[0],q[1]));lo=base.map(b=>b.clone().addScaledVector(F.d,t0));hi=base.map(b=>b.clone().addScaledVector(F.d,t1));}
+    const tris=EARCUT(ring.flat()),one=[],add=(a,b,c)=>one.push(a.x,a.y,a.z,b.x,b.y,b.z,c.x,c.y,c.z);
     for(let i=0;i<tris.length;i+=3){add(lo[tris[i]],lo[tris[i+1]],lo[tris[i+2]]);add(hi[tris[i]],hi[tris[i+2]],hi[tris[i+1]]);}
-    for(let i=0;i<ring.length;i++){const j=(i+1)%ring.length;add(lo[i],hi[i],hi[j]);add(lo[i],hi[j],lo[j]);}}
+    for(let i=0;i<ring.length;i++){const j=(i+1)%ring.length;add(lo[i],hi[i],hi[j]);add(lo[i],hi[j],lo[j]);}
+    // each prism faces outward on its own (signed volume)
+    let v=0;for(let i=0;i<one.length;i+=9)v+=one[i]*(one[i+4]*one[i+8]-one[i+5]*one[i+7])-one[i+1]*(one[i+3]*one[i+8]-one[i+5]*one[i+6])+one[i+2]*(one[i+3]*one[i+7]-one[i+4]*one[i+6]);
+    if(v<0)for(let i=0;i<one.length;i+=9)for(let k=0;k<3;k++){const t=one[i+3+k];one[i+3+k]=one[i+6+k];one[i+6+k]=t;}
+    for(const x of one)pos.push(x);}
+  if(probe)g.disposeBoundsTree();
   progress(0.3);await tick();
   let cutter=new THREE.BufferGeometry();cutter.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
   cutter=BGU.mergeVertices(cutter,1e-6);
-  // make the prisms point outward (sign of the enclosed volume)
-  const vol=signedVolume(cutter);if(vol<0){const I=cutter.index.array;for(let i=0;i<I.length;i+=3){const t=I[i+1];I[i+1]=I[i+2];I[i+2]=t;}}
   cutter.computeVertexNormals();const model=A.geo.clone();model.computeVertexNormals();
   const ev=new Evaluator();ev.attributes=['position','normal'];ev.useGroups=false;
   const r=ev.evaluate(new Brush(model),new Brush(cutter),SUBTRACTION);progress(0.9);await tick();
-  return{geo:cleanGeometry(r.geometry),touched:polys.length,failed:0};
+  return{geo:cleanGeometry(r.geometry),touched:polys.length,failed:0,skipped};
 }
 // make every face's normals point out of the solid: shoot a ray from a few of its triangles along the normal
 // and count crossings (odd = it starts inside). CAD files often mix orientations between bodies and faces.
@@ -392,8 +486,6 @@ function orientFaces(g){const I=g.index.array,P=g.attributes.position,fid=g.user
       votes++;if(cnt%2)inside++;}
     if(votes&&inside*2>votes){flipped++;for(const t of l){const k=I[3*t+1];I[3*t+1]=I[3*t+2];I[3*t+2]=k;}}}
   g.disposeBoundsTree();return flipped;}
-function signedVolume(g){const P=g.attributes.position,I=g.index.array,a=new THREE.Vector3(),b=new THREE.Vector3(),c=new THREE.Vector3();let v=0;
-  for(let i=0;i<I.length;i+=3){a.fromBufferAttribute(P,I[i]);b.fromBufferAttribute(P,I[i+1]);c.fromBufferAttribute(P,I[i+2]);v+=a.dot(b.cross(c));}return v/6;}
 async function applyOp(){
   if(A.busy||!A.geo)return;if(!E.built().shapes.length){showErr('There are no openings to apply. Place an attractor closer to the model, raise the influence radius, or lower the minimum hole size.');return;}
   A.busy=true;showErr('');setBusy(true,'Applying…');const pr=$('progress'),bar=pr.firstElementChild;pr.hidden=false;const progress=f=>{bar.style.width=Math.round(f*100)+'%';};
@@ -404,6 +496,7 @@ async function applyOp(){
     else r=await clipOp(A.op,A.depth,progress);
     A.history.push({geo:A.geo,faces:A.faces,finfo:A.finfo});A.geo=r.geo;A.closed=isClosed(A.geo);A.finfo=faceInfo(A.geo);
     if(![...A.faces].every(id=>A.finfo.has(id)))A.faces=defaultFaces();A.applied=true;showGeometry();computeFrame();paint();refresh();
+    if(r.skipped)showErr(`${r.skipped} opening${r.skipped>1?'s':''} ran off the selected faces and were left out.`);
     if(r.failed)showErr(`${r.failed} small triangle${r.failed>1?'s':''} could not be split and were left as they were.`);
   }catch(err){console.error(err);showErr('Something went wrong while applying the pattern: '+err.message);}
   finally{A.busy=false;setBusy(false);pr.hidden=true;bar.style.width='0';}
@@ -504,7 +597,7 @@ function stats(){const b=E.built();let minD=Infinity;for(const sh of b.shapes){i
   let h=st.map(([l,v])=>`<span class="stat"><span>${l}</span><b>${v}</b></span>`).join('');if(b.dropped)h+=`<span class="stat"><span>Too small</span><b>${b.dropped}</b></span>`;$('stats').innerHTML=h;}
 function summaries(){
   $('sumModel').textContent=A.name?`${A.name} · ${A.closed?'solid':'surface'}`:'';
-  $('sumPlace').textContent=`${A.faces.size} face${A.faces.size===1?'':'s'} · from ${{auto:'faces',top:'top',front:'front',right:'side',view:'view'}[A.dir]} · ${A.rot}° · ${S.margin} mm margin`;
+  $('sumPlace').textContent=`${A.faces.size} face${A.faces.size===1?'':'s'} · ${{wrap:'wrapped',top:'from top',front:'from front',right:'from side',view:'from view'}[A.dir]} · ${A.rot}° · ${S.margin} mm margin`;
   $('sumAttr').textContent=`${A.atts.length} attractor${A.atts.length===1?'':'s'} · ${S.R} mm radius`;
   const p=E.PMAP[S.pattern];$('sumPattern').textContent=`${p.name} · ${S.s} mm cell`;
   $('sumApply').textContent=A.op==='cut'?'Cut out':`${A.op==='emboss'?'Extrude':'Recess'} ${A.depth} mm`;
